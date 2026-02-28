@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.vetnet183/book-metadata-mcp",
+  "title": "Book Metadata",
+  "description": "Search Google Books and Open Library for book metadata, cover art, and publication info. Smart scoring with study guide detection.",
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "book-metadata-mcp",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

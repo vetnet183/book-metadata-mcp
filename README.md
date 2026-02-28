@@ -1,5 +1,7 @@
 # book-metadata-mcp
 
+<!-- mcp-name: io.github.vetnet183/book-metadata-mcp -->
+
 An MCP server that searches **Google Books** and **Open Library** to find book metadata, cover art, and publication info. Built for use with Claude Code, Claude Desktop, and any MCP-compatible client.
 
 ## Features
