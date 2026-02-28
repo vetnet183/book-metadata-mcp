@@ -369,17 +369,14 @@ def _best_year(results: list[dict], best: dict) -> int | None:
 
     Open Library's first_publish_year is usually the original publication date.
     Google Books often returns modern reprint/edition dates.
-    We take the earliest credible year from either source.
+    We take the earliest credible year across ALL results from both sources.
     """
-    best_year = _extract_year(best.get("published_date"))
-    ol_year = None
+    years = []
     for r in results:
-        if r.get("source") == "open_library" and r.get("published_date"):
-            ol_year = _extract_year(r["published_date"])
-            break
-    if ol_year and best_year:
-        return min(ol_year, best_year)
-    return ol_year or best_year
+        y = _extract_year(r.get("published_date"))
+        if y:
+            years.append(y)
+    return min(years) if years else None
 
 
 # ── Waterfall Search Engine ───────────────────────────────────────────────────
