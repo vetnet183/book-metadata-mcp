@@ -62,7 +62,7 @@ _google_cb = {
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = os.environ.get(
     "BOOK_MCP_USER_AGENT",
-    "BookMetadataMCP/0.1.3 (https://github.com/vetnet183/book-metadata-mcp)",
+    "BookMetadataMCP/0.1.4 (https://github.com/vetnet183/book-metadata-mcp)",
 )
 SESSION.timeout = 15
 
@@ -445,6 +445,34 @@ def _best_year(results: list[dict], best: dict) -> int | None:
     return min(years) if years else None
 
 
+# ── Image Dimension Check ────────────────────────────────────────────────────
+
+
+def _check_image_dimensions(url: str) -> dict | None:
+    """Download an image and return its actual pixel dimensions.
+
+    Returns dict with width, height, and file_size_kb, or None on failure.
+    Uses a short timeout and streams only enough data to read the header.
+    """
+    try:
+        from PIL import Image
+
+        resp = SESSION.get(url, timeout=10)
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        if "image" not in content_type and len(resp.content) < 1000:
+            return None
+        img = Image.open(io.BytesIO(resp.content))
+        return {
+            "width": img.size[0],
+            "height": img.size[1],
+            "file_size_kb": round(len(resp.content) / 1024, 1),
+        }
+    except Exception as e:
+        log.debug("Dimension check failed for %s: %s", url, e)
+        return None
+
+
 # ── Waterfall Search Engine ───────────────────────────────────────────────────
 
 
@@ -516,17 +544,26 @@ def get_cover(
     author: str = "",
     isbn: str = "",
     prefer_source: str = "google",
+    verify_dimensions: bool = False,
+    min_width: int = 0,
 ) -> str:
     """Get the best available cover image URL for a book.
 
     Returns URLs for the largest available cover images from each source.
     Google Books covers go up to ~1280px wide; Open Library covers are L size.
 
+    When verify_dimensions is True, each cover URL is fetched to report
+    actual pixel dimensions (width, height, file_size_kb). This is slower
+    but tells you exactly what resolution you're getting. Covers below
+    min_width are filtered out.
+
     Args:
         title: Book title
         author: Author name (recommended for accuracy)
         isbn: ISBN for exact matching
         prefer_source: 'google' (default, best quality) or 'openlibrary'
+        verify_dimensions: If True, download each cover to check actual pixel size
+        min_width: Minimum pixel width to accept (only used with verify_dimensions)
     """
     results = _waterfall_search(title, author, isbn, limit=3)
 
@@ -560,10 +597,29 @@ def get_cover(
 
             covers.append(cover_entry)
 
-    if prefer_source == "google":
-        covers.sort(key=lambda c: (c["source"] != "google_books", -c["match_score"]))
+    if verify_dimensions:
+        for cover in covers:
+            dims = _check_image_dimensions(cover["url"])
+            if dims:
+                cover["dimensions"] = dims
+        # Filter by min_width if specified
+        if min_width > 0:
+            covers = [
+                c for c in covers
+                if c.get("dimensions", {}).get("width", 0) >= min_width
+            ]
+        # Sort by actual pixel area (largest first) within source preference
+        covers.sort(
+            key=lambda c: (
+                c["source"] != ("google_books" if prefer_source == "google" else "open_library"),
+                -(c.get("dimensions", {}).get("width", 0) * c.get("dimensions", {}).get("height", 0)),
+            )
+        )
     else:
-        covers.sort(key=lambda c: (c["source"] != "open_library", -c["match_score"]))
+        if prefer_source == "google":
+            covers.sort(key=lambda c: (c["source"] != "google_books", -c["match_score"]))
+        else:
+            covers.sort(key=lambda c: (c["source"] != "open_library", -c["match_score"]))
 
     return json.dumps({
         "query": {"title": title, "author": author},
