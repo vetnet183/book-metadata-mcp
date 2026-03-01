@@ -13,6 +13,12 @@ Source priority:
   2. Open Library API  — Free, comprehensive metadata, community-maintained
 
 Both sources are free and require no API keys for basic usage.
+
+Rate limiting:
+  Google Books allows ~1,000 requests/day without an API key. For bulk usage,
+  a circuit breaker automatically skips Google after repeated 429 errors and
+  falls back to Open Library, retrying Google after a cooldown period.
+  Set GOOGLE_BOOKS_API_KEY for higher quotas.
 """
 
 import io
@@ -39,11 +45,24 @@ OPENLIBRARY_COVERS_URL = "https://covers.openlibrary.org/b"
 GOOGLE_DELAY = float(os.environ.get("GOOGLE_DELAY", "0.5"))
 OPENLIBRARY_DELAY = float(os.environ.get("OPENLIBRARY_DELAY", "0.35"))
 
+# Circuit breaker for Google Books 429 rate limiting.
+# After GOOGLE_CB_THRESHOLD consecutive 429 failures, Google is skipped for
+# GOOGLE_CB_COOLDOWN seconds. This prevents wasting ~7s per book on retries
+# that will fail during bulk operations without an API key.
+GOOGLE_CB_THRESHOLD = int(os.environ.get("GOOGLE_CB_THRESHOLD", "3"))
+GOOGLE_CB_COOLDOWN = float(os.environ.get("GOOGLE_CB_COOLDOWN", "60"))
+
+_google_cb = {
+    "consecutive_429s": 0,
+    "cooldown_until": 0.0,
+    "total_trips": 0,
+}
+
 # HTTP session
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = os.environ.get(
     "BOOK_MCP_USER_AGENT",
-    "BookMetadataMCP/0.1 (https://github.com/colonylibrary/book-metadata-mcp)",
+    "BookMetadataMCP/0.1.3 (https://github.com/vetnet183/book-metadata-mcp)",
 )
 SESSION.timeout = 15
 
@@ -63,7 +82,17 @@ mcp = FastMCP("Book Metadata")
 
 
 def _google_search(title: str, author: str = "", isbn: str = "", limit: int = 3) -> list[dict]:
-    """Search Google Books API. Returns list of normalized results."""
+    """Search Google Books API. Returns list of normalized results.
+
+    Uses a circuit breaker to avoid wasting time on retries when rate-limited.
+    After GOOGLE_CB_THRESHOLD consecutive 429 responses, Google is skipped for
+    GOOGLE_CB_COOLDOWN seconds and Open Library handles requests alone.
+    """
+    # Circuit breaker: skip Google if in cooldown
+    now = time.time()
+    if _google_cb["cooldown_until"] > now:
+        return []
+
     parts = []
     if isbn:
         parts.append(f"isbn:{isbn}")
@@ -81,16 +110,21 @@ def _google_search(title: str, author: str = "", isbn: str = "", limit: int = 3)
         params["key"] = GOOGLE_API_KEY
 
     data = None
+    got_429 = False
     for attempt in range(3):
         try:
             resp = SESSION.get(GOOGLE_BOOKS_URL, params=params)
             if resp.status_code == 429:
+                got_429 = True
                 wait = 2 ** attempt
                 log.info("Google Books 429 — retrying in %ds", wait)
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
             data = resp.json()
+            # Success — reset circuit breaker
+            if _google_cb["consecutive_429s"] > 0:
+                _google_cb["consecutive_429s"] = 0
             break
         except Exception as e:
             if attempt < 2:
@@ -100,6 +134,19 @@ def _google_search(title: str, author: str = "", isbn: str = "", limit: int = 3)
             return []
 
     if data is None:
+        # All retries exhausted (likely persistent 429)
+        if got_429:
+            _google_cb["consecutive_429s"] += 1
+            if _google_cb["consecutive_429s"] >= GOOGLE_CB_THRESHOLD:
+                _google_cb["cooldown_until"] = time.time() + GOOGLE_CB_COOLDOWN
+                _google_cb["total_trips"] += 1
+                log.warning(
+                    "Google Books circuit breaker OPEN — skipping for %ds "
+                    "(trip #%d, %d consecutive 429s). Using Open Library only.",
+                    GOOGLE_CB_COOLDOWN, _google_cb["total_trips"],
+                    _google_cb["consecutive_429s"],
+                )
+                _google_cb["consecutive_429s"] = 0
         return []
 
     results = []
@@ -144,20 +191,28 @@ def _google_search(title: str, author: str = "", isbn: str = "", limit: int = 3)
 
 
 def _google_get_full_covers(google_id: str) -> dict:
-    """Fetch full volume detail to get all 6 cover sizes. Retries on 429."""
+    """Fetch full volume detail to get all 6 cover sizes. Respects circuit breaker."""
+    # Circuit breaker: skip if in cooldown
+    if _google_cb["cooldown_until"] > time.time():
+        return {}
+
     params: dict = {}
     if GOOGLE_API_KEY:
         params["key"] = GOOGLE_API_KEY
 
+    got_429 = False
     for attempt in range(3):
         try:
             resp = SESSION.get(f"{GOOGLE_BOOKS_URL}/{google_id}", params=params)
             if resp.status_code == 429:
+                got_429 = True
                 wait = 2 ** attempt
                 log.info("Google Books 429 — retrying in %ds (attempt %d)", wait, attempt + 1)
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
+            if _google_cb["consecutive_429s"] > 0:
+                _google_cb["consecutive_429s"] = 0
             data = resp.json()
             return data.get("volumeInfo", {}).get("imageLinks", {})
         except Exception as e:
@@ -166,6 +221,17 @@ def _google_get_full_covers(google_id: str) -> dict:
                 continue
             log.warning("Google Books detail fetch failed for %s: %s", google_id, e)
             return {}
+
+    if got_429:
+        _google_cb["consecutive_429s"] += 1
+        if _google_cb["consecutive_429s"] >= GOOGLE_CB_THRESHOLD:
+            _google_cb["cooldown_until"] = time.time() + GOOGLE_CB_COOLDOWN
+            _google_cb["total_trips"] += 1
+            log.warning(
+                "Google Books circuit breaker OPEN — skipping for %ds (trip #%d)",
+                GOOGLE_CB_COOLDOWN, _google_cb["total_trips"],
+            )
+            _google_cb["consecutive_429s"] = 0
     return {}
 
 

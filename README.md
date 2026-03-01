@@ -100,7 +100,20 @@ All configuration is optional via environment variables:
 | `GOOGLE_BOOKS_API_KEY` | *(none)* | Optional Google API key for higher quota (1,000/day without) |
 | `GOOGLE_DELAY` | `0.5` | Seconds between Google API calls |
 | `OPENLIBRARY_DELAY` | `0.35` | Seconds between Open Library API calls |
-| `BOOK_MCP_USER_AGENT` | `BookMetadataMCP/0.1` | User-Agent for API requests |
+| `GOOGLE_CB_THRESHOLD` | `3` | Consecutive 429 failures before circuit breaker trips |
+| `GOOGLE_CB_COOLDOWN` | `60` | Seconds to skip Google after circuit breaker trips |
+| `BOOK_MCP_USER_AGENT` | `BookMetadataMCP/0.1.3` | User-Agent for API requests |
+
+### Bulk Usage / Rate Limiting
+
+Google Books allows ~1,000 requests/day without an API key. For libraries larger than ~500 books, you'll hit rate limits. The server handles this automatically:
+
+1. **Circuit breaker** — After 3 consecutive 429 responses, Google is skipped for 60 seconds
+2. **Graceful fallback** — Open Library continues serving results during Google cooldown
+3. **Auto-recovery** — Google is retried after the cooldown period expires
+4. **Zero errors** — Rate limiting never causes failures, just temporary loss of Google-specific data
+
+For the best bulk experience, set `GOOGLE_BOOKS_API_KEY` to a [Google Cloud API key](https://console.cloud.google.com/apis/credentials) with Books API enabled (free tier: 1,000/day; paid: higher).
 
 ## How Scoring Works
 
@@ -133,17 +146,20 @@ Each result is scored on a 0-100+ scale:
 
 ## Stress Test Results
 
-Tested against 1,920 audiobook titles:
+Tested against 1,920 audiobook titles (v0.1.3, fresh install, no API key):
 
 | Metric | Result |
 |--------|--------|
-| Match rate | **92.2%** |
+| Match rate | **92.2%** (1,752 / 1,901 processed) |
 | Errors | **0** |
-| High-confidence matches (90+) | **68%** |
-| Has cover URL | **88.5%** |
-| Has ISBN | **77.0%** |
-| Speed | ~1 book/sec |
+| High-confidence matches (>=70) | **80%** (1,523) |
+| Has cover URL | **85%** (1,629) |
+| Has ISBN | **75%** (1,444) |
+| Has publication year | **99.9%** of matches |
+| Speed | 0.5-0.7 books/sec |
+| Google 429 handling | Circuit breaker tripped, graceful OL fallback |
 
+All 5 tools pass: `search_book`, `get_cover`, `get_metadata`, `download_cover`, `bulk_search`.
 Edge case tests: **26/26 passed** (Unicode, short titles, empty inputs, special characters, ISBN lookup, bulk limits).
 
 ## License
