@@ -7,18 +7,22 @@ An MCP server that searches **Google Books** and **Open Library** to find book m
 ## Features
 
 - **Multi-source search** — Queries Google Books and Open Library simultaneously, scores results by match quality
+- **One-call lookup** — `find_book` returns title, authors, year, description, ISBNs, subjects, and cover in a single call
 - **High-res covers** — Google Books covers up to ~1280px wide (6 sizes), Open Library L-size covers
 - **Smart scoring** — Title/author matching with study guide detection (CliffsNotes, SparkNotes automatically deprioritized)
 - **Accurate publication years** — Cross-references both sources, picks the earliest credible year (avoids modern reprint dates)
 - **Batch mode** — Search up to 20 books at once
+- **Tool annotations** — MCP behavior hints enable client auto-approval of safe read-only tools
+- **Instructional errors** — Error responses include suggestions to help agents self-correct
 - **No API keys required** — Works out of the box with free tiers
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `search_book` | Search by title, author, or ISBN. Returns scored results from both sources. |
-| `get_cover` | Find the best available cover image URL (prioritizes largest size). |
+| `find_book` | **Recommended.** Complete single-book lookup — returns title, authors, year, description, ISBNs, subjects, and cover in one call. |
+| `search_book` | Search by title, author, or ISBN. Returns multiple scored candidates from both sources. |
+| `get_cover` | Find the best available cover image URL (prioritizes largest size). Supports dimension verification. |
 | `get_metadata` | Get merged metadata: author, year, description, ISBN, subjects, page count. |
 | `download_cover` | Download cover image and save as JPEG. Requires `Pillow`. |
 | `bulk_search` | Search multiple books at once (up to 20 per batch). |
@@ -102,7 +106,7 @@ All configuration is optional via environment variables:
 | `OPENLIBRARY_DELAY` | `0.35` | Seconds between Open Library API calls |
 | `GOOGLE_CB_THRESHOLD` | `3` | Consecutive 429 failures before circuit breaker trips |
 | `GOOGLE_CB_COOLDOWN` | `60` | Seconds to skip Google after circuit breaker trips |
-| `BOOK_MCP_USER_AGENT` | `BookMetadataMCP/0.1.3` | User-Agent for API requests |
+| `BOOK_MCP_USER_AGENT` | `BookMetadataMCP/0.2.0` | User-Agent for API requests |
 
 ### Bulk Usage / Rate Limiting
 

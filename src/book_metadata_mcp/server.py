@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Book Metadata MCP Server — Multi-source book lookup for AI assistants.
 
-Provides 5 tools over stdio transport:
+Provides 6 tools over stdio transport:
   1. search_book      — Waterfall search: Google Books + Open Library
-  2. get_cover        — Get best available cover image URL (largest first)
-  3. get_metadata     — Full metadata: author, year, description, ISBN, subjects
-  4. download_cover   — Download cover image bytes, save to disk
-  5. bulk_search      — Search multiple books at once (batch mode)
+  2. find_book        — Complete single-book lookup (search + metadata + cover)
+  3. get_cover        — Get best available cover image URL (largest first)
+  4. get_metadata     — Full metadata: author, year, description, ISBN, subjects
+  5. download_cover   — Download cover image bytes, save to disk
+  6. bulk_search      — Search multiple books at once (batch mode)
 
 Source priority:
   1. Google Books API  — Publisher-verified data, 6 cover sizes up to ~1280px
@@ -31,6 +32,7 @@ from pathlib import Path
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -62,7 +64,7 @@ _google_cb = {
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = os.environ.get(
     "BOOK_MCP_USER_AGENT",
-    "BookMetadataMCP/0.1.4 (https://github.com/vetnet183/book-metadata-mcp)",
+    "BookMetadataMCP/0.2.0 (https://github.com/vetnet183/book-metadata-mcp)",
 )
 SESSION.timeout = 15
 
@@ -501,7 +503,12 @@ def _waterfall_search(
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 def search_book(
     title: str,
     author: str = "",
@@ -509,21 +516,31 @@ def search_book(
 ) -> str:
     """Search for a book across Google Books and Open Library.
 
+    Returns multiple candidate results ranked by match quality. Use this
+    when you need to compare several editions or aren't sure of the exact
+    title. For a single book with full metadata, use find_book instead.
+    For batch operations, use bulk_search.
+
     Waterfall strategy: queries both sources, scores results by
     title/author match quality, and returns the best matches.
-
-    Google Books provides publisher-verified data and high-res covers.
-    Open Library provides comprehensive metadata and community curation.
 
     Args:
         title: Book title to search for (e.g. 'The Great Gatsby')
         author: Author name for better matching (e.g. 'F. Scott Fitzgerald')
-        isbn: ISBN-10 or ISBN-13 for exact matching
+        isbn: ISBN-10 or ISBN-13 for exact matching (e.g. '9780743273565')
     """
     results = _waterfall_search(title, author, isbn, limit=5)
 
     if not results:
-        return json.dumps({"error": f"No results found for '{title}' by '{author}'"})
+        return json.dumps({
+            "error": f"No results found for '{title}' by '{author}'.",
+            "suggestions": [
+                "Check spelling of title and author",
+                "Try searching with title only (omit author)",
+                "Try a shorter or simplified title",
+                "Use ISBN if available for exact matching",
+            ],
+        })
 
     output = []
     for r in results[:5]:
@@ -538,7 +555,134 @@ def search_book(
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
+def find_book(
+    title: str,
+    author: str = "",
+    isbn: str = "",
+) -> str:
+    """Find a book and return complete information in one call.
+
+    Combines search, metadata, and cover lookup into a single result.
+    This is the recommended tool for most book lookups — it returns title,
+    authors, publication year, description, ISBNs, subjects, cover URLs,
+    and match confidence score all at once.
+
+    Use search_book instead if you need multiple candidate results.
+    Use get_cover with verify_dimensions=True if you need exact pixel sizes.
+    Use bulk_search for multiple books at once.
+
+    Args:
+        title: Book title (e.g. 'Dune')
+        author: Author name for better matching (e.g. 'Frank Herbert')
+        isbn: ISBN for exact matching (e.g. '9780441013593')
+    """
+    results = _waterfall_search(title, author, isbn, limit=3)
+
+    if not results:
+        return json.dumps({
+            "error": f"No results found for '{title}' by '{author}'.",
+            "suggestions": [
+                "Check spelling of title and author",
+                "Try searching with title only (omit author)",
+                "Try a shorter or simplified title",
+                "Use ISBN if available for exact matching",
+            ],
+        })
+
+    best = results[0]
+
+    # Enrich with description from Open Library if needed
+    if not best.get("description") and best.get("source") == "google_books":
+        for r in results:
+            if r.get("source") == "open_library" and r.get("work_key"):
+                desc = _openlibrary_get_description(r["work_key"])
+                if desc:
+                    best["ol_description"] = desc
+                break
+
+    if not best.get("description") and best.get("work_key"):
+        desc = _openlibrary_get_description(best["work_key"])
+        if desc:
+            best["description"] = desc
+
+    # Get full cover sizes from Google Books detail endpoint
+    cover_urls = {}
+    best_cover_url = best.get("cover_url")
+    if best.get("source") == "google_books" and best.get("google_id"):
+        full_links = _google_get_full_covers(best["google_id"])
+        if full_links:
+            cover_urls = {
+                k: v.replace("http://", "https://")
+                for k, v in full_links.items()
+            }
+            for size in ["extraLarge", "large", "medium"]:
+                if size in cover_urls:
+                    best_cover_url = cover_urls[size]
+                    break
+    elif not best_cover_url:
+        # Check other results for a cover
+        for r in results[1:]:
+            if r.get("cover_url"):
+                best_cover_url = r["cover_url"]
+                if r.get("source") == "google_books" and r.get("google_id"):
+                    full_links = _google_get_full_covers(r["google_id"])
+                    if full_links:
+                        cover_urls = {
+                            k: v.replace("http://", "https://")
+                            for k, v in full_links.items()
+                        }
+                        for size in ["extraLarge", "large", "medium"]:
+                            if size in cover_urls:
+                                best_cover_url = cover_urls[size]
+                                break
+                break
+
+    # Collect supplementary ISBNs/categories from other sources
+    isbn_13 = best.get("isbn_13")
+    isbn_10 = best.get("isbn_10")
+    categories = best.get("categories", [])
+    for r in results[1:]:
+        if not isbn_13 and r.get("isbn_13"):
+            isbn_13 = r["isbn_13"]
+        if not isbn_10 and r.get("isbn_10"):
+            isbn_10 = r["isbn_10"]
+        if not categories and r.get("categories"):
+            categories = r["categories"]
+
+    output = {
+        "title": best.get("title"),
+        "authors": best.get("authors", []),
+        "publish_year": _best_year(results, best),
+        "description": best.get("description") or best.get("ol_description"),
+        "isbn_13": isbn_13,
+        "isbn_10": isbn_10,
+        "categories": categories,
+        "page_count": best.get("page_count"),
+        "language": best.get("language"),
+        "cover_url": best_cover_url,
+        "cover_sizes": cover_urls if cover_urls else None,
+        "source": best.get("source"),
+        "match_score": round(best.get("_score", 0), 1),
+    }
+
+    # Remove None values for cleaner output
+    output = {k: v for k, v in output.items() if v is not None}
+
+    return json.dumps(output, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 def get_cover(
     title: str,
     author: str = "",
@@ -549,18 +693,19 @@ def get_cover(
 ) -> str:
     """Get the best available cover image URL for a book.
 
-    Returns URLs for the largest available cover images from each source.
-    Google Books covers go up to ~1280px wide; Open Library covers are L size.
+    Returns cover URLs sorted by quality. Use this when you need fine
+    control over cover selection (source preference, dimension filtering,
+    all available sizes). For a quick lookup with cover included, use
+    find_book instead. To download and save the image, use download_cover.
 
-    When verify_dimensions is True, each cover URL is fetched to report
-    actual pixel dimensions (width, height, file_size_kb). This is slower
-    but tells you exactly what resolution you're getting. Covers below
-    min_width are filtered out.
+    Google Books covers go up to ~1280px wide (6 sizes); Open Library
+    provides L-size covers. When verify_dimensions is True, each URL is
+    fetched to report actual pixel dimensions — slower but precise.
 
     Args:
-        title: Book title
-        author: Author name (recommended for accuracy)
-        isbn: ISBN for exact matching
+        title: Book title (e.g. 'Dune')
+        author: Author name for better matching (e.g. 'Frank Herbert')
+        isbn: ISBN for exact matching (e.g. '9780441013593')
         prefer_source: 'google' (default, best quality) or 'openlibrary'
         verify_dimensions: If True, download each cover to check actual pixel size
         min_width: Minimum pixel width to accept (only used with verify_dimensions)
@@ -568,7 +713,15 @@ def get_cover(
     results = _waterfall_search(title, author, isbn, limit=3)
 
     if not results:
-        return json.dumps({"error": f"No cover found for '{title}'"})
+        return json.dumps({
+            "error": f"No cover found for '{title}'.",
+            "suggestions": [
+                "Check spelling of the title",
+                "Try adding the author name for better matching",
+                "Use ISBN if available for exact matching",
+                "Not all books have cover images in Google Books or Open Library",
+            ],
+        })
 
     covers = []
     for r in results:
@@ -628,7 +781,12 @@ def get_cover(
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 def get_metadata(
     title: str,
     author: str = "",
@@ -636,23 +794,32 @@ def get_metadata(
 ) -> str:
     """Get comprehensive book metadata from the best available source.
 
-    Returns a merged metadata record combining the best data from
-    Google Books and Open Library. Includes description, publication
-    year, ISBNs, subjects, and page count.
+    Returns a merged metadata record with description, publication year,
+    ISBNs, subjects, and page count. Use this when you already know which
+    book you want and need detailed metadata. For a complete lookup including
+    cover art, use find_book instead. For multiple books, use bulk_search.
 
     For publication year, the server picks the earliest credible year
     across sources — Open Library tracks original publication dates
     while Google Books often returns modern reprint dates.
 
     Args:
-        title: Book title
-        author: Author name (recommended for accuracy)
-        isbn: ISBN for exact matching
+        title: Book title (e.g. 'Pride and Prejudice')
+        author: Author name for better matching (e.g. 'Jane Austen')
+        isbn: ISBN for exact matching (e.g. '9780141439518')
     """
     results = _waterfall_search(title, author, isbn, limit=3)
 
     if not results:
-        return json.dumps({"error": f"No metadata found for '{title}'"})
+        return json.dumps({
+            "error": f"No metadata found for '{title}'.",
+            "suggestions": [
+                "Check spelling of title and author",
+                "Try searching with title only (omit author)",
+                "Try a shorter or simplified title",
+                "Use ISBN if available for exact matching",
+            ],
+        })
 
     best = results[0]
 
@@ -709,7 +876,12 @@ def get_metadata(
     return json.dumps(metadata, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+))
 def download_cover(
     title: str,
     author: str = "",
@@ -718,13 +890,16 @@ def download_cover(
 ) -> str:
     """Download the best available cover image and save to disk.
 
-    Searches for the book, finds the highest quality cover,
-    downloads it, and saves as JPEG. Returns the file path and
-    image dimensions.
+    Searches for the book, finds the highest quality cover, downloads it,
+    and saves as JPEG. Returns the file path and image dimensions. Requires
+    Pillow (install with: pip install 'book-metadata-mcp[covers]').
+
+    This tool writes a file to disk. The cover source may update over time,
+    so repeated calls may produce different images.
 
     Args:
-        title: Book title
-        author: Author name (recommended)
+        title: Book title (e.g. 'Neuromancer')
+        author: Author name for better matching (e.g. 'William Gibson')
         isbn: ISBN for exact matching
         save_path: Full path to save the image (e.g. '/tmp/cover.jpg').
                    If empty, saves to /tmp/book_cover_{title_slug}.jpg
@@ -733,7 +908,11 @@ def download_cover(
         from PIL import Image
     except ImportError:
         return json.dumps({
-            "error": "Pillow is required for download_cover. Install with: pip install Pillow"
+            "error": "Pillow is required for download_cover.",
+            "suggestions": [
+                "Install with: pip install 'book-metadata-mcp[covers]'",
+                "Or: pip install Pillow",
+            ],
         })
 
     cover_json = get_cover(title, author, isbn)
@@ -741,7 +920,15 @@ def download_cover(
 
     best = cover_data.get("best_cover")
     if not best:
-        return json.dumps({"error": f"No cover found for '{title}'"})
+        return json.dumps({
+            "error": f"No cover found for '{title}'.",
+            "suggestions": [
+                "Check spelling of the title",
+                "Try adding the author name for better matching",
+                "Use ISBN if available for exact matching",
+                "Not all books have cover images available",
+            ],
+        })
 
     url = best["url"]
 
@@ -749,21 +936,39 @@ def download_cover(
         resp = SESSION.get(url, timeout=20)
         resp.raise_for_status()
     except Exception as e:
-        return json.dumps({"error": f"Download failed: {e}", "url": url})
+        return json.dumps({
+            "error": f"Download failed: {e}",
+            "url": url,
+            "suggestions": [
+                "The cover URL may be temporarily unavailable",
+                "Try again in a few seconds",
+                "Try get_cover to find alternative URLs",
+            ],
+        })
 
     content_type = resp.headers.get("Content-Type", "")
     if "image" not in content_type and len(resp.content) < 1000:
         return json.dumps({
-            "error": "Downloaded content is not an image",
+            "error": "Downloaded content is not an image.",
             "content_type": content_type,
             "size": len(resp.content),
+            "suggestions": [
+                "The cover URL may have changed or expired",
+                "Try get_cover to find a fresh URL",
+            ],
         })
 
     try:
         img = Image.open(io.BytesIO(resp.content))
         width, height = img.size
     except Exception as e:
-        return json.dumps({"error": f"Invalid image data: {e}"})
+        return json.dumps({
+            "error": f"Invalid image data: {e}",
+            "suggestions": [
+                "The image file may be corrupted at the source",
+                "Try get_cover to find an alternative cover URL",
+            ],
+        })
 
     if not save_path:
         slug = re.sub(r"[^a-z0-9]+", "_", title.lower())[:50]
@@ -788,31 +993,57 @@ def download_cover(
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+))
 def bulk_search(
     books: str,
 ) -> str:
-    """Search for multiple books at once.
+    """Search for multiple books at once (up to 20 per batch).
 
-    Takes a JSON array of {title, author} objects and returns
-    the best match for each. Useful for batch metadata lookups.
+    Takes a JSON array of {title, author} objects and returns the best
+    match for each. Use this for batch metadata lookups when you have a
+    list of books. For a single book with full metadata, use find_book.
 
-    Rate-limited to respect API quotas.
+    Rate-limited to respect API quotas. Each book takes ~1-2 seconds.
 
     Args:
         books: JSON array of objects with 'title' and optional 'author' fields.
                Example: [{"title": "1984", "author": "Orwell"}, {"title": "Dune"}]
+               Maximum 20 books per batch.
     """
     try:
         book_list = json.loads(books)
     except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid JSON: {e}"})
+        return json.dumps({
+            "error": f"Invalid JSON: {e}",
+            "suggestions": [
+                "Pass a JSON array of objects: [{\"title\": \"Book\", \"author\": \"Author\"}]",
+                "Ensure all strings are double-quoted (JSON requires double quotes)",
+                "Check for trailing commas which are not valid JSON",
+            ],
+        })
 
     if not isinstance(book_list, list):
-        return json.dumps({"error": "Expected a JSON array of {title, author} objects"})
+        return json.dumps({
+            "error": "Expected a JSON array of {title, author} objects.",
+            "suggestions": [
+                "Wrap your books in a JSON array: [{\"title\": \"Book\"}]",
+                "Each element should have 'title' and optionally 'author' and 'isbn'",
+            ],
+        })
 
     if len(book_list) > 20:
-        return json.dumps({"error": f"Max 20 books per batch, got {len(book_list)}"})
+        return json.dumps({
+            "error": f"Max 20 books per batch, got {len(book_list)}.",
+            "suggestions": [
+                "Split your list into batches of 20 or fewer",
+                "Call bulk_search multiple times with smaller batches",
+            ],
+        })
 
     results = []
     for i, book in enumerate(book_list):
